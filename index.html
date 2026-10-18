@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Control de facturas por Ruta — v3</title>
+  <style>
+    :root { font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial; }
+    body { margin: 0; background:#f5f7fb; color:#111; }
+    header { background:#c53030; color:#fff; padding:18px 24px; border-bottom:4px solid rgba(0,0,0,0.06);}
+    .container { display:flex; gap:18px; padding:18px; max-width:1400px; margin:20px auto }
+    .panel { background:#fff; border-radius:12px; padding:16px; box-shadow:0 6px 18px rgba(16,24,40,0.06); flex:1 }
+    .left { min-width:350px; max-width:480px }
+    /* Dropzone más grande y visible */
+    .dropzone { margin-top:10px; padding:42px; border:2px dashed #cbd5e1; border-radius:10px; text-align:center; color:#64748b; cursor:pointer; font-size:18px; background:#fff; }
+    .dropzone.dragover { background:#fff0f0; border-color:#c53030; color:#2b2b2b }
+    .route-card { border:1px solid #f2d6d6; padding:14px; border-radius:8px; margin-bottom:12px }
+    table { width:100%; border-collapse:collapse; margin-top:6px; font-size:13px; }
+    th,td { padding:8px 10px; border-bottom:1px solid #eee; text-align:left; vertical-align:top; }
+    .btn { padding:8px 12px; border-radius:8px; background:#c53030; color:#fff; border:none; cursor:pointer; font-size:13px; }
+    .btn.small { font-size:12px; padding:6px 8px; }
+    .btn.gray { background:#71717a; }
+    .btn.danger { background:#dc2626; }
+    .factura-chip { display:flex; gap:6px; margin-top:6px; align-items:center; }
+    .factura-chip span { font-size:12px; background:#eef2ff; padding:4px 8px; border-radius:8px; }
+    /* Producto resaltado si tiene facturas */
+    tr.pedido-con-facturas td { background:#f0fdf4; }
+    tr.pedido-con-facturas td:first-child { border-left:4px solid #34d399; }
+    .art-ref { font-weight:600; }
+    .art-name { color:#4b5563; font-size:12px; }
+    .note { font-size:13px; color:#374151 }
+  </style>
+</head>
+<body>
+<header><h1>Control de Facturas por Ruta — v3</h1></header>
+<div class="container">
+  <div class="panel left">
+    <label>1) Cargar archivo Excel de productos (.xlsx)</label>
+    <input id="xlsxInput" type="file" accept=".xlsx" />
+    <div class="note">Columnas: <b>Transportista, Ruta, Identificador de tarea, Representante del cliente, Tipo de servicio, Expedidor, Artículo – Nombre, Artículo – Referencia, Artículo – Cantidad</b></div>
+    <label style="margin-top:12px">2) Arrastra o selecciona PDFs</label>
+    <div id="dropzone" class="dropzone">Arrastra PDFs aquí o haz click para seleccionar (múltiple)</div>
+    <input id="pdfFileInput" type="file" accept="application/pdf" multiple style="display:none" />
+    <label style="margin-top:12px">Acciones</label>
+    <button id="clearAll" class="btn small" style="background:#eee;color:#c53030;border:1px solid #f4c7c7">Limpiar Todo</button>
+  </div>
+  <div class="panel" id="mainPanel">
+    <div id="routesContainer"></div>
+  </div>
+</div>
+
+<script src="xlsx.full.min.js"></script>
+<script src="pdf-lib.min.js"></script>
+<script src="pdf.min.js"></script>
+<script>
+// worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+
+// Datos: cada fila del Excel es ahora un PRODUCTO (una tarea puede tener varios)
+let rows = [];
+const routeMap = new Map();
+const globalInvoiceSet = new Set(); // evita duplicados por número de factura
+
+// Extrae número de factura: busca "Número" seguido de texto (ajustable)
+function extractInvoiceNumber(text){
+  const regex = /(Número|Number)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)/i;
+  const m = text.match(regex);
+  return m ? m[2].trim() : null;
+}
+
+// Normaliza nombres de cabecera (tolera tildes, mayúsculas y distintos tipos de guion: – — - )
+function normHeader(s){
+  return String(s)
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/\s*-\s*/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+// Obtiene el valor de una columna por nombre, tolerando variaciones en la cabecera
+function getCol(rowObj, name){
+  const target = normHeader(name);
+  for(const k of Object.keys(rowObj)){
+    if(normHeader(k) === target) return rowObj[k];
+  }
+  return '';
+}
+
+// ¿El texto contiene la referencia como token completo? (evita que "123" coincida con "1234")
+function textHasReference(text, ref){
+  if(!ref) return false;
+  const esc = String(ref).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('(?<![A-Za-z0-9])' + esc + '(?![A-Za-z0-9])', 'i').test(text);
+}
+
+// Leer XLSX
+document.getElementById('xlsxInput').addEventListener('change', async (e)=>{
+  const file = e.target.files[0]; if(!file) return;
+  const buffer = await file.arrayBuffer();
+  const wb = XLSX.read(buffer,{type:'array'});
+  const sheet = wb.SheetNames[0];
+  const data = XLSX.utils.sheet_to_json(wb.Sheets[sheet],{defval:''});
+
+  rows = [];
+  routeMap.clear();
+  globalInvoiceSet.clear();
+
+  // Aviso si faltan columnas nuevas
+  if(data.length){
+    const headers = Object.keys(data[0]).map(normHeader);
+    const required = ['Artículo – Nombre', 'Artículo – Referencia', 'Artículo – Cantidad'];
+    const missing = required.filter(c => !headers.includes(normHeader(c)));
+    if(missing.length) alert('Faltan columnas en el Excel: ' + missing.join(', '));
+  }
+
+  data.forEach(r=>{
+    const obj = {
+      Transportista: getCol(r, 'Transportista') || '',
+      Ruta: getCol(r, 'Ruta') || '',
+      Identificador: String(getCol(r, 'Identificador de tarea') || '').trim(),
+      Representante: getCol(r, 'Representante del cliente') || '',
+      TipoServicio: String(getCol(r, 'Tipo de servicio') || '').toLowerCase(),
+      Expedidor: getCol(r, 'Expedidor') || '',
+      ArticuloNombre: String(getCol(r, 'Artículo – Nombre') || '').trim(),
+      ArticuloReferencia: String(getCol(r, 'Artículo – Referencia') || '').trim(),
+      ArticuloCantidad: String(getCol(r, 'Artículo – Cantidad') || '').trim(),
+      pdfs: [] // cada pdf: { name, bytes, invoiceNumber }
+    };
+    if(!obj.Identificador) return; // fila sin tarea: se ignora
+    rows.push(obj);
+    if(!routeMap.has(obj.Ruta)) routeMap.set(obj.Ruta, []);
+    routeMap.get(obj.Ruta).push(rows.length - 1);
+  });
+  renderRouteTables();
+});
+
+function renderRouteTables(){
+  const rc = document.getElementById('routesContainer');
+  rc.innerHTML = '';
+  for(const [ruta, idxs] of routeMap.entries()){
+    const transportista = rows[idxs[0]].Transportista || '';
+    const card = document.createElement('div');
+    card.className = 'route-card';
+    card.innerHTML = `
+<div style="display:flex;justify-content:space-between;align-items:center">
+<strong>${escapeHtml(transportista)} — Ruta: ${escapeHtml(ruta)}</strong>
+<div>
+<button class="btn small dl-all" data-ruta="${encodeURIComponent(ruta)}">Descargar Ruta PDF</button>
+</div>
+</div>
+<table>
+<thead><tr><th>ID tarea</th><th>Representante</th><th>Expedidor</th><th>Artículo</th><th>Cant.</th><th>Facturas</th></tr></thead>
+<tbody></tbody>
+</table>
+`;
+    const tbody = card.querySelector('tbody');
+    idxs.forEach(i => {
+      const r = rows[i];
+      const tr = document.createElement('tr');
+      tr.dataset.idx = i;
+      tr.innerHTML = `
+<td>${escapeHtml(r.Identificador)}${r.TipoServicio === 'recogida' ? ' <strong>(RMA)</strong>' : ''}</td>
+<td>${escapeHtml(r.Representante)}</td>
+<td>${escapeHtml(r.Expedidor)}</td>
+<td><div class="art-ref">${escapeHtml(r.ArticuloReferencia)}</div><div class="art-name">${escapeHtml(r.ArticuloNombre)}</div></td>
+<td>${escapeHtml(r.ArticuloCantidad)}</td>
+<td class="facturas-cell"></td>
+`;
+      tbody.appendChild(tr);
+    });
+    rc.appendChild(card);
+  }
+
+  // conectar botón descargar por ruta
+  document.querySelectorAll('.dl-all').forEach(b => b.onclick = () => downloadGroupedRuta(decodeURIComponent(b.dataset.ruta)));
+  updateTablesUI();
+}
+
+function refreshFacturaList(tr){
+  const idx = Number(tr.dataset.idx);
+  const cell = tr.querySelector('.facturas-cell');
+  const r = rows[idx];
+  cell.innerHTML = '';
+
+  // si no hay facturas, mostrar texto pequeño
+  if(r.pdfs.length === 0){
+    cell.innerHTML = '<span style="color:#6b7280;font-size:13px">— Sin facturas —</span>';
+    return;
+  }
+
+  r.pdfs.forEach((p, i) => {
+    const div = document.createElement('div');
+    div.className = 'factura-chip';
+    div.innerHTML = `
+<span>Factura: ${escapeHtml(p.invoiceNumber || p.name)}</span>
+<button class="btn small gray" data-preview="${i}">👁️</button>
+<button class="btn small danger" data-delete="${i}">🗑️</button>
+`;
+    cell.appendChild(div);
+
+    div.querySelector('[data-preview]').onclick = () => {
+      const url = URL.createObjectURL(new Blob([p.bytes], { type: 'application/pdf' }));
+      window.open(url, '_blank');
+    };
+
+    div.querySelector('[data-delete]').onclick = () => {
+      // eliminar factura de este producto
+      const removed = r.pdfs.splice(i, 1)[0];
+      // liberar el número solo si ningún otro producto sigue usando esa factura
+      if(removed && removed.invoiceNumber){
+        const stillUsed = rows.some(row => row.pdfs.some(pp => pp.invoiceNumber === removed.invoiceNumber));
+        if(!stillUsed) globalInvoiceSet.delete(removed.invoiceNumber);
+      }
+      updateTablesUI();
+    };
+  });
+}
+
+function updateTablesUI(){
+  document.querySelectorAll('tbody tr').forEach(tr => {
+    refreshFacturaList(tr);
+    const idx = Number(tr.dataset.idx);
+    if(rows[idx].pdfs.length > 0) tr.classList.add('pedido-con-facturas');
+    else tr.classList.remove('pedido-con-facturas');
+  });
+}
+
+// Drag & drop
+const dropzone = document.getElementById('dropzone');
+const pdfFileInput = document.getElementById('pdfFileInput');
+dropzone.addEventListener('click', () => pdfFileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dragover'); handleFiles(e.dataTransfer.files); });
+pdfFileInput.addEventListener('change', e => handleFiles(e.target.files));
+
+async function handleFiles(files){
+  files = [...files].filter(f => f.type === 'application/pdf');
+  for(const f of files) await processPdf(f);
+  updateTablesUI();
+}
+
+async function processPdf(file){
+  try{
+    const buffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+    let text = '';
+    for(let p = 1; p <= pdf.numPages; p++){
+      const page = await pdf.getPage(p);
+      const c = await page.getTextContent();
+      text += c.items.map(i => i.str).join(' ') + '\n';
+    }
+
+    const invoiceNumber = extractInvoiceNumber(text);
+    if(!invoiceNumber){
+      alert(`No se encontró número de factura en ${file.name}. Se omite.`);
+      return;
+    }
+    if(globalInvoiceSet.has(invoiceNumber)){
+      alert(`Factura duplicada detectada: ${invoiceNumber} — fichero: ${file.name}`);
+      return;
+    }
+
+    // 1) Productos cuya tarea (Identificador) aparece en la factura
+    const taskMatches = rows
+      .map((r, i) => (r.Identificador && text.includes(r.Identificador)) ? i : -1)
+      .filter(i => i !== -1);
+
+    if(taskMatches.length === 0){
+      alert(`PDF ${file.name} no coincide con ningún identificador.`);
+      return;
+    }
+
+    // 2) De ellos, solo los productos cuya Artículo – Referencia también aparece en la factura
+    const matches = taskMatches.filter(i => textHasReference(text, rows[i].ArticuloReferencia));
+
+    if(matches.length === 0){
+      const tareas = [...new Set(taskMatches.map(i => rows[i].Identificador))].join(', ');
+      alert(`La factura ${invoiceNumber} (${file.name}) coincide con la tarea ${tareas}, pero no contiene ninguna de las referencias de artículo esperadas. Se descarta.`);
+      return;
+    }
+
+    const cleaned = await removeLastTwoPages(buffer);
+    globalInvoiceSet.add(invoiceNumber);
+    matches.forEach(i => {
+      rows[i].pdfs.push({ name: file.name, bytes: cleaned, invoiceNumber });
+    });
+  }catch(err){
+    console.error('Error procesando PDF', err);
+    alert('Error leyendo PDF ' + file.name);
+  }
+}
+
+async function removeLastTwoPages(buffer){
+  const { PDFDocument } = PDFLib;
+  const src = await PDFDocument.load(buffer);
+  const count = src.getPageCount();
+  const out = await PDFDocument.create();
+  const copyCount = Math.max(count - 2, 1);
+  const pages = await out.copyPages(src, Array.from({ length: copyCount }, (_, i) => i));
+  pages.forEach(p => out.addPage(p));
+  return await out.save();
+}
+
+// Descargar grouped ruta (concatena las facturas de la ruta, sin repetir una misma factura
+// aunque esté asociada a varios productos)
+async function downloadGroupedRuta(ruta){
+  const idxs = routeMap.get(ruta) || [];
+  const docs = [];
+  const seen = new Set();
+  idxs.forEach(i => rows[i].pdfs.forEach(p => {
+    const key = p.invoiceNumber || p.name;
+    if(seen.has(key)) return;
+    seen.add(key);
+    docs.push(p.bytes);
+  }));
+  if(docs.length === 0){ alert('Esta ruta no tiene facturas cargadas.'); return; }
+
+  const { PDFDocument, StandardFonts } = PDFLib;
+  const out = await PDFDocument.create();
+  const font = await out.embedFont(StandardFonts.Helvetica);
+
+  for(const bytes of docs){
+    const src = await PDFDocument.load(bytes);
+    const pages = await out.copyPages(src, src.getPageIndices());
+    pages.forEach(p => out.addPage(p));
+  }
+
+  // Añadir cabecera simple en cada página
+  out.getPages().forEach((p, pi) => {
+    p.drawText(`Ruta: ${ruta}`, { x: 20, y: p.getHeight() - 28, size: 10, font });
+  });
+
+  const pdf = await out.save();
+  const url = URL.createObjectURL(new Blob([pdf], { type: 'application/pdf' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `RUTA_${ruta}.pdf`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// utilidad: escapar HTML minimal
+function escapeHtml(s){
+  if(!s) return '';
+  return String(s).replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c] || c));
+}
+
+// Limpiar todo
+document.getElementById('clearAll').onclick = () => { if(confirm('¿Seguro? Esto vacía todo.')) location.reload(); };
+</script>
+</body>
+</html>
