@@ -26,6 +26,11 @@
     /* Producto resaltado si tiene facturas */
     tr.pedido-con-facturas td { background:#f0fdf4; }
     tr.pedido-con-facturas td:first-child { border-left:4px solid #34d399; }
+    /* Fila de recogida (devolución / RMA) */
+    tr.fila-recogida td { background:#fff7ed; }
+    tr.fila-recogida td:first-child { border-left:4px solid #f97316; }
+    tr.fila-recogida.pedido-con-facturas td { background:#ffedd5; }
+    .badge-rma { display:inline-block; margin-left:6px; padding:2px 7px; border-radius:999px; background:#f97316; color:#fff; font-size:11px; font-weight:700; letter-spacing:.3px; white-space:nowrap; }
     .art-ref { font-weight:600; }
     .art-name { color:#4b5563; font-size:12px; }
     .note { font-size:13px; color:#374151 }
@@ -77,6 +82,20 @@ function normHeader(s){
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
+}
+
+// Normaliza texto libre para comparar (sin tildes, minúsculas, espacios colapsados)
+function normText(s){
+  return String(s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+// ¿La fila es una recogida (devolución / RMA)?
+function isRecogida(r){
+  return normText(r.TipoServicio) === 'recogida';
 }
 
 // Obtiene el valor de una columna por nombre, tolerando variaciones en la cabecera
@@ -160,8 +179,9 @@ function renderRouteTables(){
       const r = rows[i];
       const tr = document.createElement('tr');
       tr.dataset.idx = i;
+      if(isRecogida(r)) tr.classList.add('fila-recogida');
       tr.innerHTML = `
-<td>${escapeHtml(r.Identificador)}${r.TipoServicio === 'recogida' ? ' <strong>(RMA)</strong>' : ''}</td>
+<td>${escapeHtml(r.Identificador)}${isRecogida(r) ? ' <span class="badge-rma" title="Recogida / Devolución">↩ DEVOLUCIÓN</span>' : ''}</td>
 <td>${escapeHtml(r.Representante)}</td>
 <td>${escapeHtml(r.Expedidor)}</td>
 <td><div class="art-ref">${escapeHtml(r.ArticuloReferencia)}</div><div class="art-name">${escapeHtml(r.ArticuloNombre)}</div></td>
@@ -263,13 +283,30 @@ async function processPdf(file){
       return;
     }
 
-    // 1) Productos cuya tarea (Identificador) aparece en la factura
+    // 1) Productos cuya tarea (Identificador) aparece en la factura.
+    //    Excepción: en filas de RECOGIDA el PDF no incluye el Identificador, así que
+    //    también se acepta si aparece el Representante del cliente.
+    const textNorm = normText(text);
+
+    // ¿Es un PDF de devolución? Debe contener "Pedido de devolución" y "ERMA"
+    const esDevolucion = textNorm.includes('pedido de devolucion') && /(?<![a-z0-9])erma/.test(textNorm);
+
+    // Un PDF de devolución solo puede ir a filas de recogida;
+    // un PDF normal solo puede ir a filas que NO son recogida.
     const taskMatches = rows
-      .map((r, i) => (r.Identificador && text.includes(r.Identificador)) ? i : -1)
+      .map((r, i) => {
+        if(isRecogida(r) !== esDevolucion) return -1;
+        const porTarea = r.Identificador && text.includes(r.Identificador);
+        const porRepresentante = esDevolucion && r.Representante &&
+          textNorm.includes(normText(r.Representante));
+        return (porTarea || porRepresentante) ? i : -1;
+      })
       .filter(i => i !== -1);
 
     if(taskMatches.length === 0){
-      alert(`PDF ${file.name} no coincide con ningún identificador.`);
+      alert(esDevolucion
+        ? `El PDF ${file.name} es un pedido de devolución, pero no coincide con ninguna recogida (representante o tarea).`
+        : `PDF ${file.name} no coincide con ningún identificador de entrega.`);
       return;
     }
 
@@ -278,7 +315,7 @@ async function processPdf(file){
 
     if(matches.length === 0){
       const tareas = [...new Set(taskMatches.map(i => rows[i].Identificador))].join(', ');
-      alert(`La factura ${invoiceNumber} (${file.name}) coincide con la tarea ${tareas}, pero no contiene ninguna de las referencias de artículo esperadas. Se descarta.`);
+      alert(`La factura ${invoiceNumber} (${file.name}) coincide con la(s) tarea(s) ${tareas}, pero no contiene ninguna de las referencias de artículo esperadas. Se descarta.`);
       return;
     }
 
