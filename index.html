@@ -95,7 +95,8 @@ function normText(s){
 
 // ¿La fila es una recogida (devolución / RMA)?
 function isRecogida(r){
-  return normText(r.TipoServicio) === 'recogida';
+  const t = normText(r.TipoServicio);
+  return t === 'recogida' || t === 'pickup' || t === 'pick up' || t === 'pick-up';
 }
 
 // Obtiene el valor de una columna por nombre, tolerando variaciones en la cabecera
